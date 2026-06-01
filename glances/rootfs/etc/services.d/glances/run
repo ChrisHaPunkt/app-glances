@@ -59,11 +59,27 @@ if [[ -n "${EXPORTER_PID:-}" ]]; then
     bashio::log.info "Glances web server started (PID: ${WEBSERVER_PID})"
 
     shutdown() {
+        local STOP_TIMEOUT=30
+        local elapsed=0
+
         bashio::log.info "Stopping Glances..."
         bashio::log.debug "Sending SIGTERM to web server (PID: ${WEBSERVER_PID})..."
         kill "${WEBSERVER_PID}" 2>/dev/null
         bashio::log.debug "Sending SIGTERM to exporter (PID: ${EXPORTER_PID})..."
         kill "${EXPORTER_PID}" 2>/dev/null
+
+        # Poll until both processes exit or the graceful-shutdown deadline expires.
+        while kill -0 "${WEBSERVER_PID}" 2>/dev/null || kill -0 "${EXPORTER_PID}" 2>/dev/null; do
+            if (( elapsed >= STOP_TIMEOUT )); then
+                bashio::log.warning "Graceful shutdown timed out after ${STOP_TIMEOUT}s; sending SIGKILL..."
+                kill -9 "${WEBSERVER_PID}" 2>/dev/null
+                kill -9 "${EXPORTER_PID}" 2>/dev/null
+                break
+            fi
+            sleep 1
+            (( elapsed++ ))
+        done
+
         wait "${WEBSERVER_PID}" 2>/dev/null
         bashio::log.info "- Web server stopped"
         wait "${EXPORTER_PID}" 2>/dev/null
