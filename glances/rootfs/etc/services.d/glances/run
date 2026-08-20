@@ -57,15 +57,31 @@ fi
 # The exporter quits when its target is unreachable, for example when InfluxDB
 # is down or has not started up yet. Restart it instead of tearing down the
 # app, so the web interface stays available regardless of the exporter state.
-exporter_supervisor() {
-    local pid
+exporter_child_pid=''
 
-    trap 'kill "${pid}" 2>/dev/null || true; exit 0' TERM INT
+# Stop the exporter currently being supervised, if any, and wait for it to
+# actually be gone before giving up supervision. This app runs in the host PID
+# namespace, so only ever signal a PID that is known to still be our child.
+# shellcheck disable=SC2329  # Invoked indirectly, via trap
+stop_exporter() {
+    trap '' TERM INT
+
+    if bashio::var.has_value "${exporter_child_pid}"; then
+        kill "${exporter_child_pid}" 2>/dev/null || true
+        wait "${exporter_child_pid}" 2>/dev/null || true
+    fi
+
+    exit 0
+}
+
+exporter_supervisor() {
+    trap stop_exporter TERM INT
 
     while true; do
         glances "${exporter_options[@]}" &
-        pid=$!
-        wait "${pid}" || true
+        exporter_child_pid=$!
+        wait "${exporter_child_pid}" || true
+        exporter_child_pid=''
         bashio::log.warning 'Glances exporter exited, restarting...'
         sleep 10
     done
