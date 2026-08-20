@@ -27,71 +27,92 @@ if bashio::config.true 'influxdb.enabled'; then
     fi
 fi
 
-# Glances v4 does not support --export in webserver mode (-w).
-# Run a separate lightweight instance in quiet/standalone mode for exports.
-if (( ${#exporters[@]} > 0 )); then
-    bashio::log.info 'Starting Glances exporter...'
-    declare -a exporter_options=(
-        -C /etc/glances.conf
-        --quiet
-        --time "$(bashio::config 'refresh_time')"
-        --export "$(IFS=,; echo "${exporters[*]}")"
-    )
-    if bashio::config.false 'process_info'; then
-        exporter_options+=(--disable-process)
-    fi
-    glances "${exporter_options[@]}" &
-    EXPORTER_PID=$!
-    bashio::log.info "Glances exporter started (PID: ${EXPORTER_PID})"
-fi
-
 if bashio::debug; then
     options+=(--debug)
 fi
 
-# When an exporter is running, both processes run in the background so we can
-# detect if either one crashes (wait -n exits on the first child to terminate).
-# SIGTERM from HA (addon stop) is forwarded to both children for clean shutdown.
-# Without an exporter, the simple exec path is used.
-if [[ -n "${EXPORTER_PID:-}" ]]; then
-    glances "${options[@]}" &
-    WEBSERVER_PID=$!
-    bashio::log.info "Glances web server started (PID: ${WEBSERVER_PID})"
-
-    shutdown() {
-        local STOP_TIMEOUT=30
-        local elapsed=0
-
-        bashio::log.info "Stopping Glances..."
-        bashio::log.debug "Sending SIGTERM to web server (PID: ${WEBSERVER_PID})..."
-        kill "${WEBSERVER_PID}" 2>/dev/null
-        bashio::log.debug "Sending SIGTERM to exporter (PID: ${EXPORTER_PID})..."
-        kill "${EXPORTER_PID}" 2>/dev/null
-
-        # Poll until both processes exit or the graceful-shutdown deadline expires.
-        while kill -0 "${WEBSERVER_PID}" 2>/dev/null || kill -0 "${EXPORTER_PID}" 2>/dev/null; do
-            if (( elapsed >= STOP_TIMEOUT )); then
-                bashio::log.warning "Graceful shutdown timed out after ${STOP_TIMEOUT}s; sending SIGKILL..."
-                kill -9 "${WEBSERVER_PID}" 2>/dev/null
-                kill -9 "${EXPORTER_PID}" 2>/dev/null
-                break
-            fi
-            sleep 1
-            (( elapsed++ ))
-        done
-
-        wait "${WEBSERVER_PID}" 2>/dev/null
-        bashio::log.info "- Web server stopped"
-        wait "${EXPORTER_PID}" 2>/dev/null
-        bashio::log.info "- Exporter stopped"
-        bashio::log.info "Glances stopped"
-        exit 0
-    }
-    trap shutdown TERM INT
-    wait -n
-    bashio::log.fatal "A Glances process exited unexpectedly, stopping container..."
-    kill "${WEBSERVER_PID}" "${EXPORTER_PID}" 2>/dev/null
-    exit 1
-else
+# Without an exporter configured, Glances is the only process to run.
+if (( ${#exporters[@]} == 0 )); then
     exec glances "${options[@]}"
 fi
+
+# Glances v4 refuses to export while running as a web server; exporting is
+# only available in standalone or client mode. A second, quiet, standalone
+# Glances instance therefore handles the exporting.
+# https://github.com/nicolargo/glances/issues/614
+declare -a exporter_options=()
+exporter_options+=(-C /etc/glances.conf)
+exporter_options+=(--quiet)
+exporter_options+=(--time "$(bashio::config 'refresh_time')")
+exporter_options+=(--export "$(IFS=,; echo "${exporters[*]}")")
+
+if bashio::config.false 'process_info'; then
+    exporter_options+=(--disable-process)
+fi
+
+if bashio::debug; then
+    exporter_options+=(--debug)
+fi
+
+# The exporter quits when its target is unreachable, for example when InfluxDB
+# is down or has not started up yet. Restart it instead of tearing down the
+# app, so the web interface stays available regardless of the exporter state.
+exporter_supervisor() {
+    local pid
+
+    trap 'kill "${pid}" 2>/dev/null || true; exit 0' TERM INT
+
+    while true; do
+        glances "${exporter_options[@]}" &
+        pid=$!
+        wait "${pid}" || true
+        bashio::log.warning 'Glances exporter exited, restarting...'
+        sleep 10
+    done
+}
+
+bashio::log.info 'Starting Glances exporter...'
+exporter_supervisor &
+readonly EXPORTER_PID=$!
+
+glances "${options[@]}" &
+readonly WEBSERVER_PID=$!
+
+# Forward a stop request to both processes, giving them room to shut down
+# gracefully before resorting to SIGKILL.
+# shellcheck disable=SC2329  # Invoked indirectly, via trap
+stop_glances() {
+    local timeout=30
+    local elapsed=0
+
+    trap '' TERM INT
+
+    bashio::log.info 'Stopping Glances...'
+    kill "${EXPORTER_PID}" "${WEBSERVER_PID}" 2>/dev/null || true
+
+    while kill -0 "${EXPORTER_PID}" 2>/dev/null \
+        || kill -0 "${WEBSERVER_PID}" 2>/dev/null; do
+        if (( elapsed >= timeout )); then
+            bashio::log.warning \
+                "Glances did not stop within ${timeout}s, sending SIGKILL..."
+            kill -9 "${EXPORTER_PID}" "${WEBSERVER_PID}" 2>/dev/null || true
+            break
+        fi
+        sleep 1
+        elapsed=$(( elapsed + 1 ))
+    done
+
+    wait "${EXPORTER_PID}" 2>/dev/null || true
+    wait "${WEBSERVER_PID}" 2>/dev/null || true
+
+    bashio::log.info 'Glances stopped'
+    exit 0
+}
+trap stop_glances TERM INT
+
+# The exporter supervises itself, so getting here means the web server is gone.
+# Stop the exporter as well and let the app be restarted.
+wait -n || true
+bashio::log.warning 'Glances exited unexpectedly, stopping...'
+kill "${EXPORTER_PID}" 2>/dev/null || true
+exit 1
